@@ -1,0 +1,8 @@
+{
+  "name": "iServe Africa IMS",
+  "description": "Integrated Enterprise Resource Planning and Organisational Management System for iServe Africa in Nairobi, Kenya — uniting Finance, HR, Apprenticeships, Bookstore POS, Projects, Procurement, Approvals, and Reporting.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

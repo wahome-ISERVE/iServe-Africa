@@ -1,0 +1,1491 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global Safety Net (Default Deny)
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // -------------------------------------------------------------------------
+    // Core Primitives & Validation Helpers
+    // -------------------------------------------------------------------------
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isBootstrappedAdmin() {
+      return isVerifiedUser() && request.auth.token.email == 'wahome@iserveafrica.org';
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isOwner(uid) {
+      return isVerifiedUser() && request.auth.uid == uid;
+    }
+
+    function hasActiveUserDoc() {
+      return isVerifiedUser()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.status == 'active';
+    }
+
+    function currentUserRole() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role;
+    }
+
+    function isAdmin() {
+      return isBootstrappedAdmin() || (hasActiveUserDoc() && currentUserRole() == 'super_admin');
+    }
+
+    function isExecutive() {
+      return isAdmin() || (hasActiveUserDoc() && currentUserRole() in ['executive_director', 'senior_management']);
+    }
+
+    function isFinance() {
+      return isExecutive() || (hasActiveUserDoc() && currentUserRole() == 'finance_officer');
+    }
+
+    function isHR() {
+      return isExecutive() || (hasActiveUserDoc() && currentUserRole() == 'hr_officer');
+    }
+
+    function isSupervisor() {
+      return isHR() || (hasActiveUserDoc() && currentUserRole() in ['apprentice_supervisor', 'department_head']);
+    }
+
+    function isBookstoreStaff() {
+      return isFinance() || (hasActiveUserDoc() && currentUserRole() in ['bookstore_manager', 'bookstore_assistant']);
+    }
+
+    function isBookstoreManager() {
+      return isFinance() || (hasActiveUserDoc() && currentUserRole() == 'bookstore_manager');
+    }
+
+    function isProjectOfficer() {
+      return isExecutive() || (hasActiveUserDoc() && currentUserRole() in ['project_officer', 'department_head']);
+    }
+
+    function isDepartmentHead() {
+      return isExecutive() || (hasActiveUserDoc() && currentUserRole() == 'department_head');
+    }
+
+    function isStr(val, minLen, maxLen) {
+      return val is string && val.size() >= minLen && val.size() <= maxLen;
+    }
+
+    function isNonNegNum(val) {
+      return (val is int || val is float) && val >= 0;
+    }
+
+    function isPosNum(val) {
+      return (val is int || val is float) && val > 0;
+    }
+
+    function isBoundedUidList(listVal) {
+      return listVal is list && listVal.size() <= 30 && (listVal.size() == 0 || listVal[0] is string);
+    }
+
+    function isViewer(data) {
+      return ('viewerUids' in data) && data.viewerUids is list && (request.auth.uid in data.viewerUids);
+    }
+
+    function isValidRole(role) {
+      return role in [
+        'super_admin',
+        'executive_director',
+        'senior_management',
+        'finance_officer',
+        'hr_officer',
+        'department_head',
+        'project_officer',
+        'bookstore_manager',
+        'bookstore_assistant',
+        'apprentice_supervisor',
+        'staff_member',
+        'apprentice'
+      ];
+    }
+
+    // -------------------------------------------------------------------------
+    // Health / Connection Check
+    // -------------------------------------------------------------------------
+    match /test/connection {
+      allow get: if isSignedIn();
+    }
+
+    // -------------------------------------------------------------------------
+    // 1. Settings (/settings/{settingId})
+    // -------------------------------------------------------------------------
+    function isValidOrgSettings(data) {
+      return data.keys().hasAll(['orgId', 'orgName', 'currency', 'timezone', 'fiscalYear', 'updatedAt'])
+        && data.keys().hasOnly([
+          'orgId', 'orgName', 'tagline', 'address', 'currency', 'timezone',
+          'primaryColor', 'accentColor', 'fiscalYear', 'reportingPeriod',
+          'quickbooksStatus', 'mpesaStatus', 'fcmStatus', 'updatedBy', 'updatedAt'
+        ])
+        && data.orgId == 'iserve-africa'
+        && isStr(data.orgName, 2, 160)
+        && isStr(data.currency, 3, 8)
+        && isStr(data.timezone, 3, 64)
+        && isStr(data.fiscalYear, 4, 16)
+        && (!('tagline' in data) || isStr(data.tagline, 0, 240))
+        && (!('address' in data) || isStr(data.address, 0, 240))
+        && (!('primaryColor' in data) || isStr(data.primaryColor, 3, 32))
+        && (!('accentColor' in data) || isStr(data.accentColor, 3, 32))
+        && (!('reportingPeriod' in data) || isStr(data.reportingPeriod, 1, 32))
+        && (!('quickbooksStatus' in data) || data.quickbooksStatus in ['not_configured', 'credentials_required', 'connected'])
+        && (!('mpesaStatus' in data) || data.mpesaStatus in ['not_configured', 'credentials_required', 'connected'])
+        && (!('fcmStatus' in data) || data.fcmStatus in ['not_configured', 'web_push_ready', 'connected'])
+        && (!('updatedBy' in data) || isStr(data.updatedBy, 1, 128))
+        && data.updatedAt == request.time;
+    }
+
+    match /settings/{settingId} {
+      allow get: if isValidId(settingId) && isVerifiedUser();
+      allow list: if isVerifiedUser() && resource.data.orgId == 'iserve-africa';
+      allow create, update: if isValidId(settingId) && isAdmin() && isValidOrgSettings(incoming());
+      allow delete: if false;
+    }
+
+    // -------------------------------------------------------------------------
+    // 2. Users (/users/{userId}) - PII Protected
+    // -------------------------------------------------------------------------
+    function isValidUserAccount(data) {
+      return data.keys().hasAll(['uid', 'email', 'displayName', 'role', 'status', 'mfaEnforced', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly([
+          'uid', 'email', 'displayName', 'role', 'departmentId', 'departmentName',
+          'jobTitle', 'phone', 'status', 'mfaEnforced', 'isDemo', 'createdAt', 'updatedAt'
+        ])
+        && isValidId(data.uid)
+        && isStr(data.email, 3, 200)
+        && isStr(data.displayName, 1, 160)
+        && isValidRole(data.role)
+        && data.status in ['active', 'inactive', 'pending']
+        && data.mfaEnforced is bool
+        && (!('departmentId' in data) || isStr(data.departmentId, 0, 128))
+        && (!('departmentName' in data) || isStr(data.departmentName, 0, 120))
+        && (!('jobTitle' in data) || isStr(data.jobTitle, 0, 120))
+        && (!('phone' in data) || isStr(data.phone, 0, 40))
+        && (!('isDemo' in data) || data.isDemo is bool)
+        && data.createdAt is timestamp
+        && data.updatedAt == request.time;
+    }
+
+    match /users/{userId} {
+      allow get: if isValidId(userId) && (isOwner(userId) || isHR());
+      allow list: if isBootstrappedAdmin() || (isVerifiedUser() && resource.data.uid == request.auth.uid);
+      allow create: if isValidId(userId) && isVerifiedUser() && isValidUserAccount(incoming())
+        && incoming().uid == userId
+        && incoming().createdAt == request.time
+        && (
+          isAdmin() ||
+          (isHR() && incoming().role != 'super_admin') ||
+          (
+            isOwner(userId)
+            && incoming().uid == request.auth.uid
+            && (
+              (isBootstrappedAdmin() && incoming().role == 'super_admin' && incoming().status == 'active') ||
+              (!isBootstrappedAdmin() && incoming().role == 'staff_member' && incoming().status == 'active')
+            )
+          )
+        );
+      allow update: if isValidId(userId) && isVerifiedUser() && isValidUserAccount(incoming())
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && (
+          isAdmin() ||
+          (
+            isHR()
+            && existing().role != 'super_admin'
+            && incoming().role != 'super_admin'
+            && (userId != request.auth.uid || incoming().role == existing().role)
+          ) ||
+          (
+            isOwner(userId)
+            && incoming().role == existing().role
+            && incoming().status == existing().status
+            && incoming().mfaEnforced == existing().mfaEnforced
+            && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'phone', 'jobTitle', 'updatedAt'])
+          )
+        );
+      allow delete: if isValidId(userId) && userId != request.auth.uid && (
+        isAdmin() ||
+        (isHR() && existing().role != 'super_admin')
+      );
+    }
+
+    // -------------------------------------------------------------------------
+    // 3. Directory (/directory/{userId}) - Non-PII Organisational Summary
+    // -------------------------------------------------------------------------
+    function isValidDirectoryEntry(data) {
+      return data.keys().hasAll(['uid', 'orgId', 'displayName', 'role', 'status', 'updatedAt'])
+        && data.keys().hasOnly([
+          'uid', 'orgId', 'displayName', 'role', 'departmentId', 'departmentName',
+          'jobTitle', 'status', 'isDemo', 'updatedAt'
+        ])
+        && isValidId(data.uid)
+        && data.orgId == 'iserve-africa'
+        && isStr(data.displayName, 1, 160)
+        && isValidRole(data.role)
+        && data.status in ['active', 'inactive', 'pending']
+        && (!('departmentId' in data) || isStr(data.departmentId, 0, 128))
+        && (!('departmentName' in data) || isStr(data.departmentName, 0, 120))
+        && (!('jobTitle' in data) || isStr(data.jobTitle, 0, 120))
+        && (!('isDemo' in data) || data.isDemo is bool)
+        && data.updatedAt == request.time;
+    }
+
+    match /directory/{userId} {
+      allow get: if isValidId(userId) && isVerifiedUser();
+      allow list: if isVerifiedUser() && resource.data.orgId == 'iserve-africa';
+      allow create: if isValidId(userId) && isVerifiedUser() && isValidDirectoryEntry(incoming())
+        && incoming().uid == userId
+        && (
+          isAdmin() ||
+          (isHR() && incoming().role != 'super_admin') ||
+          (isOwner(userId) && incoming().uid == request.auth.uid && incoming().role == 'staff_member')
+        );
+      allow update: if isValidId(userId) && isVerifiedUser() && isValidDirectoryEntry(incoming())
+        && incoming().uid == existing().uid
+        && (
+          isAdmin() ||
+          (
+            isHR()
+            && existing().role != 'super_admin'
+            && incoming().role != 'super_admin'
+            && (userId != request.auth.uid || incoming().role == existing().role)
+          ) ||
+          (isOwner(userId) && incoming().role == existing().role && incoming().status == existing().status
+            && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'jobTitle', 'updatedAt']))
+        );
+      allow delete: if isValidId(userId) && userId != request.auth.uid && (
+        isAdmin() ||
+        (isHR() && existing().role != 'super_admin')
+      );
+    }
+
+    // -------------------------------------------------------------------------
+    // 4. Departments (/departments/{deptId})
+    // -------------------------------------------------------------------------
+    function isValidDepartment(data) {
+      return data.keys().hasAll(['orgId', 'code', 'name', 'annualBudgetKes', 'status', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly([
+          'orgId', 'code', 'name', 'headUserId', 'headName', 'description',
+          'annualBudgetKes', 'status', 'isDemo', 'createdAt', 'updatedAt'
+        ])
+        && data.orgId == 'iserve-africa'
+        && isStr(data.code, 2, 24)
+        && isStr(data.name, 2, 120)
+        && (!('headUserId' in data) || isStr(data.headUserId, 0, 128))
+        && (!('headName' in data) || isStr(data.headName, 0, 160))
+        && (!('description' in data) || isStr(data.description, 0, 600))
+        && isNonNegNum(data.annualBudgetKes)
+        && data.status in ['active', 'inactive']
+        && (!('isDemo' in data) || data.isDemo is bool)
+        && data.createdAt is timestamp
+        && data.updatedAt == request.time;
+    }
+
+    match /departments/{deptId} {
+      allow get: if isValidId(deptId) && isVerifiedUser();
+      allow list: if isVerifiedUser() && resource.data.orgId == 'iserve-africa';
+      allow create: if isValidId(deptId) && isExecutive() && isValidDepartment(incoming()) && incoming().createdAt == request.time;
+      allow update: if isValidId(deptId) && isExecutive() && isValidDepartment(incoming()) && incoming().createdAt == existing().createdAt;
+      allow delete: if isValidId(deptId) && isAdmin();
+    }
+
+    // -------------------------------------------------------------------------
+    // 5. Employees (/employees/{empId}) - Strict HR / Owner PII Isolation
+    // -------------------------------------------------------------------------
+    function isValidEmployee(data) {
+      return data.keys().hasAll(['orgId', 'empNo', 'userId', 'fullName', 'departmentId', 'jobTitle', 'employmentStatus', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly([
+          'orgId', 'empNo', 'userId', 'fullName', 'workEmail', 'phone', 'departmentId', 'departmentName',
+          'jobTitle', 'employmentDate', 'employmentStatus', 'contractEndDate', 'qualifications',
+          'emergencyContactName', 'emergencyContactPhone', 'nextOfKinName', 'nextOfKinRelation',
+          'salaryKes', 'allowancesKes', 'annualLeaveBalance', 'viewerUids', 'isDemo', 'createdAt', 'updatedAt'
+        ])
+        && data.orgId == 'iserve-africa'
+        && isStr(data.empNo, 2, 32)
+        && isStr(data.userId, 1, 128)
+        && isStr(data.fullName, 2, 160)
+        && isStr(data.departmentId, 1, 128)
+        && isStr(data.jobTitle, 2, 120)
+        && data.employmentStatus in ['permanent', 'contract', 'probation', 'exited']
+        && (!('workEmail' in data) || isStr(data.workEmail, 0, 200))
+        && (!('phone' in data) || isStr(data.phone, 0, 40))
+        && (!('departmentName' in data) || isStr(data.departmentName, 0, 120))
+        && (!('employmentDate' in data) || isStr(data.employmentDate, 0, 32))
+        && (!('contractEndDate' in data) || isStr(data.contractEndDate, 0, 32))
+        && (!('qualifications' in data) || isStr(data.qualifications, 0, 600))
+        && (!('emergencyContactName' in data) || isStr(data.emergencyContactName, 0, 160))
+        && (!('emergencyContactPhone' in data) || isStr(data.emergencyContactPhone, 0, 40))
+        && (!('nextOfKinName' in data) || isStr(data.nextOfKinName, 0, 160))
+        && (!('nextOfKinRelation' in data) || isStr(data.nextOfKinRelation, 0, 80))
+        && (!('salaryKes' in data) || isNonNegNum(data.salaryKes))
+        && (!('allowancesKes' in data) || isNonNegNum(data.allowancesKes))
+        && (!('annualLeaveBalance' in data) || isNonNegNum(data.annualLeaveBalance))
+        && (!('viewerUids' in data) || isBoundedUidList(data.viewerUids))
+        && (!('isDemo' in data) || data.isDemo is bool)
+        && data.createdAt is timestamp
+        && data.updatedAt == request.time;
+    }
+
+    match /employees/{empId} {
+      allow get: if isValidId(empId) && (isHR() || (isVerifiedUser() && (resource.data.userId == request.auth.uid || isViewer(resource.data))));
+      allow list: if isBootstrappedAdmin() || (isVerifiedUser() && (resource.data.userId == request.auth.uid || isViewer(resource.data)));
+      allow create: if isValidId(empId) && isHR() && isValidEmployee(incoming()) && incoming().createdAt == request.time;
+      allow update: if isValidId(empId) && isHR() && isValidEmployee(incoming()) && incoming().createdAt == existing().createdAt;
+      allow delete: if isValidId(empId) && isAdmin();
+    }
+
+    // -------------------------------------------------------------------------
+    // 6. Leave Requests (/leaveRequests/{leaveId}) & Leave Settings (/leaveSettings/{settingId})
+    // -------------------------------------------------------------------------
+    function isValidLeaveRequest(data) {
+      return data.keys().hasAll(['orgId', 'userId', 'employeeName', 'leaveType', 'startDate', 'endDate', 'daysRequested', 'status', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly([
+          'orgId', 'userId', 'employeeName', 'departmentId', 'supervisorId', 'applicantRole', 'leaveYear',
+          'leaveType', 'startDate', 'endDate', 'daysRequested', 'reason', 'emergencyContact',
+          'attachmentName', 'attachmentDataUrl', 'status', 'approverId', 'approverComment',
+          'supervisorComment', 'supervisorApprovedBy', 'hrComment', 'hrApprovedBy',
+          'viewerUids', 'isDemo', 'createdAt', 'updatedAt'
+        ])
+        && data.orgId == 'iserve-africa'
+        && isStr(data.userId, 1, 128)
+        && isStr(data.employeeName, 1, 160)
+        && data.leaveType in ['annual', 'sick', 'compassionate', 'study', 'maternity_paternity', 'unpaid']
+        && isStr(data.startDate, 8, 32)
+        && isStr(data.endDate, 8, 32)
+        && isPosNum(data.daysRequested)
+        && data.status in ['submitted', 'pending_hr', 'approved', 'rejected', 'returned', 'cancelled']
+        && (!('departmentId' in data) || isStr(data.departmentId, 0, 128))
+        && (!('supervisorId' in data) || isStr(data.supervisorId, 0, 128))
+        && (!('applicantRole' in data) || isStr(data.applicantRole, 0, 64))
+        && (!('leaveYear' in data) || isStr(data.leaveYear, 0, 16))
+        && (!('reason' in data) || isStr(data.reason, 0, 1000))
+        && (!('emergencyContact' in data) || isStr(data.emergencyContact, 0, 200))
+        && (!('attachmentName' in data) || isStr(data.attachmentName, 0, 200))
+        && (!('attachmentDataUrl' in data) || isStr(data.attachmentDataUrl, 0, 450000))
+        && (!('approverId' in data) || isStr(data.approverId, 0, 128))
+        && (!('approverComment' in data) || isStr(data.approverComment, 0, 600))
+        && (!('supervisorComment' in data) || isStr(data.supervisorComment, 0, 600))
+        && (!('supervisorApprovedBy' in data) || isStr(data.supervisorApprovedBy, 0, 160))
+        && (!('hrComment' in data) || isStr(data.hrComment, 0, 600))
+        && (!('hrApprovedBy' in data) || isStr(data.hrApprovedBy, 0, 160))
+        && (!('viewerUids' in data) || isBoundedUidList(data.viewerUids))
+        && (!('isDemo' in data) || data.isDemo is bool)
+        && data.createdAt is timestamp
+        && data.updatedAt == request.time;
+    }
+
+    match /leaveRequests/{leaveId} {
+      allow get: if isValidId(leaveId) && (isHR() || isSupervisor() || (isVerifiedUser() && (resource.data.userId == request.auth.uid || isViewer(resource.data))));
+      allow list: if isBootstrappedAdmin() || isHR() || (isVerifiedUser() && (resource.data.userId == request.auth.uid || resource.data.supervisorId == request.auth.uid || isViewer(resource.data)));
+      allow create: if isValidId(leaveId) && isVerifiedUser() && isValidLeaveRequest(incoming())
+        && incoming().createdAt == request.time
+        && (isHR() || (incoming().userId == request.auth.uid && incoming().status == 'submitted'));
+      allow update: if isValidId(leaveId) && isVerifiedUser() && isValidLeaveRequest(incoming())
+        && incoming().createdAt == existing().createdAt
+        && incoming().userId == existing().userId
+        && (
+          isAdmin() ||
+          (
+            existing().status in ['submitted', 'pending_hr', 'returned'] &&
+            (
+              (isHR() && existing().userId != request.auth.uid
+                && incoming().approverId == request.auth.uid
+                && incoming().status in ['pending_hr', 'approved', 'rejected', 'returned']
+                && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'approverId', 'approverComment', 'hrComment', 'hrApprovedBy', 'updatedAt'])) ||
+              (isSupervisor() && existing().userId != request.auth.uid
+                && existing().status == 'submitted'
+                && incoming().approverId == request.auth.uid
+                && incoming().status in ['pending_hr', 'rejected', 'returned']
+                && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'approverId', 'approverComment', 'supervisorComment', 'supervisorApprovedBy', 'updatedAt'])) ||
+              (existing().userId == request.auth.uid
+                && incoming().status in ['submitted', 'cancelled']
+                && incoming().diff(existing()).affectedKeys().hasOnly(['startDate', 'endDate', 'daysRequested', 'reason', 'emergencyContact', 'attachmentName', 'attachmentDataUrl', 'status', 'updatedAt']))
+            )
+          )
+        );
+      allow delete: if isValidId(leaveId) && isAdmin();
+    }
+
+    function isValidLeavePolicy(data) {
+      return data.keys().hasAll(['orgId', 'leaveYear', 'apprenticeAnnualEntitlementDays', 'carryForwardEnabled', 'maxCarryForwardDays', 'publicHolidays', 'updatedAt'])
+        && data.keys().hasOnly(['orgId', 'leaveYear', 'apprenticeAnnualEntitlementDays', 'carryForwardEnabled', 'maxCarryForwardDays', 'publicHolidays', 'updatedBy', 'updatedAt'])
+        && data.orgId == 'iserve-africa'
+        && isStr(data.leaveYear, 4, 16)
+        && isPosNum(data.apprenticeAnnualEntitlementDays) && data.apprenticeAnnualEntitlementDays <= 60
+        && data.carryForwardEnabled is bool
+        && isNonNegNum(data.maxCarryForwardDays) && data.maxCarryForwardDays <= 30
+        && data.publicHolidays is list && data.publicHolidays.size() <= 40
+        && (!('updatedBy' in data) || isStr(data.updatedBy, 0, 160))
+        && data.updatedAt == request.time;
+    }
+
+    match /leaveSettings/{settingId} {
+      allow get: if isValidId(settingId) && isVerifiedUser();
+      allow list: if isVerifiedUser() && resource.data.orgId == 'iserve-africa';
+      allow create, update: if isValidId(settingId) && isHR() && isValidLeavePolicy(incoming());
+      allow delete: if false;
+    }
+
+    // -------------------------------------------------------------------------
+    // 7. Appraisals (/appraisals/{appraisalId})
+    // -------------------------------------------------------------------------
+    function isValidAppraisal(data) {
+      return data.keys().hasAll(['orgId', 'employeeUserId', 'employeeName', 'period', 'objectives', 'status', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly([
+          'orgId', 'employeeUserId', 'employeeName', 'reviewerId', 'reviewerName',
+          'period', 'objectives', 'feedback', 'developmentPlan', 'rating', 'status',
+          'viewerUids', 'isDemo', 'createdAt', 'updatedAt'
+        ])
+        && data.orgId == 'iserve-africa'
+        && isStr(data.employeeUserId, 1, 128)
+        && isStr(data.employeeName, 1, 160)
+        && isStr(data.period, 2, 64)
+        && isStr(data.objectives, 2, 1500)
+        && data.status in ['draft', 'submitted', 'completed']
+        && (!('reviewerId' in data) || isStr(data.reviewerId, 0, 128))
+        && (!('reviewerName' in data) || isStr(data.reviewerName, 0, 160))
+        && (!('feedback' in data) || isStr(data.feedback, 0, 1500))
+        && (!('developmentPlan' in data) || isStr(data.developmentPlan, 0, 1000))
+        && (!('rating' in data) || ((data.rating is int || data.rating is float) && data.rating >= 1 && data.rating <= 5))
+        && (!('viewerUids' in data) || isBoundedUidList(data.viewerUids))
+        && (!('isDemo' in data) || data.isDemo is bool)
+        && data.createdAt is timestamp
+        && data.updatedAt == request.time;
+    }
+
+    match /appraisals/{appraisalId} {
+      allow get: if isValidId(appraisalId) && (isHR() || (isVerifiedUser() && (resource.data.employeeUserId == request.auth.uid || resource.data.reviewerId == request.auth.uid || isViewer(resource.data))));
+      allow list: if isBootstrappedAdmin() || (isVerifiedUser() && (resource.data.employeeUserId == request.auth.uid || resource.data.reviewerId == request.auth.uid || isViewer(resource.data)));
+      allow create: if isValidId(appraisalId) && isHR() && isValidAppraisal(incoming()) && incoming().createdAt == request.time;
+      allow update: if isValidId(appraisalId) && isVerifiedUser() && isValidAppraisal(incoming())
+        && incoming().createdAt == existing().createdAt
+        && (isHR() || (existing().status != 'completed' && existing().reviewerId == request.auth.uid));
+      allow delete: if isValidId(appraisalId) && isAdmin();
+    }
+
+    // -------------------------------------------------------------------------
+    // 8. Cohorts (/cohorts/{cohortId}) & 9. Apprentices (/apprentices/{apprenticeId})
+    // -------------------------------------------------------------------------
+    function isValidCohort(data) {
+      return data.keys().hasAll(['orgId', 'name', 'programme', 'startDate', 'endDate', 'status', 'createdAt'])
+        && data.keys().hasOnly(['orgId', 'name', 'programme', 'startDate', 'endDate', 'coordinatorName', 'status', 'isDemo', 'createdAt'])
+        && data.orgId == 'iserve-africa'
+        && isStr(data.name, 2, 120)
+        && isStr(data.programme, 2, 160)
+        && isStr(data.startDate, 8, 32)
+        && isStr(data.endDate, 8, 32)
+        && data.status in ['upcoming', 'active', 'completed']
+        && (!('coordinatorName' in data) || isStr(data.coordinatorName, 0, 160))
+        && (!('isDemo' in data) || data.isDemo is bool)
+        && data.createdAt is timestamp;
+    }
+
+    match /cohorts/{cohortId} {
+      allow get: if isValidId(cohortId) && isVerifiedUser();
+      allow list: if isVerifiedUser() && resource.data.orgId == 'iserve-africa';
+      allow create: if isValidId(cohortId) && isSupervisor() && isValidCohort(incoming()) && incoming().createdAt == request.time;
+      allow update: if isValidId(cohortId) && isSupervisor() && isValidCohort(incoming()) && incoming().createdAt == existing().createdAt;
+      allow delete: if isValidId(cohortId) && isAdmin();
+    }
+
+    function isValidApprentice(data) {
+      return data.keys().hasAll(['orgId', 'apprenticeCode', 'userId', 'fullName', 'cohortId', 'supervisorId', 'status', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly([
+          'orgId', 'apprenticeCode', 'userId', 'fullName', 'email', 'phone', 'photoDataUrl',
+          'cohortId', 'cohortName', 'startDate', 'expectedCompletionDate',
+          'supervisorId', 'supervisorName', 'region', 'trainingLocation', 'learningObjectives',
+          'emergencyContact', 'annualLeaveEntitlement', 'carryForwardDays', 'attendanceRate',
+          'status', 'viewerUids', 'isDemo', 'createdAt', 'updatedAt'
+        ])
+        && data.orgId == 'iserve-africa'
+        && isStr(data.apprenticeCode, 2, 32)
+        && isStr(data.userId, 1, 128)
+        && isStr(data.fullName, 2, 160)
+        && isStr(data.cohortId, 1, 128)
+        && isStr(data.supervisorId, 1, 128)
+        && data.status in ['active', 'needs_support', 'completed', 'deferred']
+        && (!('email' in data) || isStr(data.email, 0, 200))
+        && (!('phone' in data) || isStr(data.phone, 0, 40))
+        && (!('photoDataUrl' in data) || isStr(data.photoDataUrl, 0, 350000))
+        && (!('cohortName' in data) || isStr(data.cohortName, 0, 120))
+        && (!('startDate' in data) || isStr(data.startDate, 0, 32))
+        && (!('expectedCompletionDate' in data) || isStr(data.expectedCompletionDate, 0, 32))
+        && (!('supervisorName' in data) || isStr(data.supervisorName, 0, 160))
+        && (!('region' in data) || isStr(data.region, 0, 120))
+        && (!('trainingLocation' in data) || isStr(data.trainingLocation, 0, 160))
+        && (!('learningObjectives' in data) || isStr(data.learningObjectives, 0, 1500))
+        && (!('emergencyContact' in data) || isStr(data.emergencyContact, 0, 200))
+        && (!('annualLeaveEntitlement' in data) || (isNonNegNum(data.annualLeaveEntitlement) && data.annualLeaveEntitlement <= 60))
+        && (!('carryForwardDays' in data) || (isNonNegNum(data.carryForwardDays) && data.carryForwardDays <= 30))
+        && (!('attendanceRate' in data) || ((data.attendanceRate is int || data.attendanceRate is float) && data.attendanceRate >= 0 && data.attendanceRate <= 100))
+        && (!('viewerUids' in data) || isBoundedUidList(data.viewerUids))
+        && (!('isDemo' in data) || data.isDemo is bool)
+        && data.createdAt is timestamp
+        && data.updatedAt == request.time;
+    }
+
+    match /apprentices/{apprenticeId} {
+      allow get: if isValidId(apprenticeId) && (isSupervisor() || isHR() || isFinance() || (isVerifiedUser() && (resource.data.userId == request.auth.uid || isViewer(resource.data))));
+      allow list: if isBootstrappedAdmin() || isHR() || isFinance() || (isVerifiedUser() && (resource.data.userId == request.auth.uid || resource.data.supervisorId == request.auth.uid || isViewer(resource.data)));
+      allow create: if isValidId(apprenticeId) && (isSupervisor() || isHR()) && isValidApprentice(incoming()) && incoming().createdAt == request.time;
+      allow update: if isValidId(apprenticeId) && isValidApprentice(incoming()) && incoming().createdAt == existing().createdAt && (
+        isSupervisor() || isHR() ||
+        (hasActiveUserDoc()
+          && existing().userId == request.auth.uid
+          && incoming().diff(existing()).affectedKeys().hasOnly(['email', 'phone', 'emergencyContact', 'photoDataUrl', 'updatedAt']))
+      );
+      allow delete: if isValidId(apprenticeId) && isAdmin();
+    }
+
+    // -------------------------------------------------------------------------
+    // 10. Apprentice Reports (/apprenticeReports/{reportId})
+    // -------------------------------------------------------------------------
+    function isValidApprenticeReport(data) {
+      return data.keys().hasAll(['orgId', 'apprenticeId', 'apprenticeUserId', 'apprenticeName', 'supervisorId', 'reportType', 'periodStart', 'activities', 'status', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly([
+          'orgId', 'apprenticeId', 'apprenticeUserId', 'apprenticeName', 'supervisorId',
+          'reportType', 'periodStart', 'periodEnd', 'activities', 'lessonsLearned',
+          'challenges', 'reflections',
+          'monthlyTargetKes', 'amountRaisedKes', 'deficitKes',
+          'callsMadeThisWeek', 'newPartnersApproached', 'totalActivePartners',
+          'thingsWorked', 'thingsDidNotWork',
+          'nextWeekTargetAmountKes', 'nextWeekPartnersToReachOut',
+          'nextWeekCallsToMake', 'nextWeekNewAppointments',
+          'workProgress', 'personalDevotion', 'mentorshipUpdate',
+          'attachmentName', 'status', 'supervisorComment',
+          'evaluationScore', 'submittedAt', 'reviewedAt', 'reviewedBy',
+          'revisionCount', 'revisionHistoryJson',
+          'clientRequestId', 'viewerUids', 'isDemo', 'createdAt', 'updatedAt'
+        ])
+        && data.orgId == 'iserve-africa'
+        && isStr(data.apprenticeId, 1, 128)
+        && isStr(data.apprenticeUserId, 1, 128)
+        && isStr(data.apprenticeName, 1, 160)
+        && isStr(data.supervisorId, 1, 128)
+        && data.reportType in ['daily', 'weekly', 'monthly', 'activity', 'reflection']
+        && isStr(data.periodStart, 8, 32)
+        && isStr(data.activities, 5, 3000)
+        && data.status in ['draft', 'submitted', 'under_review', 'approved', 'returned']
+        && (!('periodEnd' in data) || isStr(data.periodEnd, 0, 32))
+        && (!('lessonsLearned' in data) || isStr(data.lessonsLearned, 0, 2000))
+        && (!('challenges' in data) || isStr(data.challenges, 0, 2000))
+        && (!('reflections' in data) || isStr(data.reflections, 0, 2000))
+        && (!('monthlyTargetKes' in data) || isNonNegNum(data.monthlyTargetKes))
+        && (!('amountRaisedKes' in data) || isNonNegNum(data.amountRaisedKes))
+        && (!('deficitKes' in data) || isNonNegNum(data.deficitKes))
+        && (!('callsMadeThisWeek' in data) || (isNonNegNum(data.callsMadeThisWeek) && data.callsMadeThisWeek <= 100000))
+        && (!('newPartnersApproached' in data) || (isNonNegNum(data.newPartnersApproached) && data.newPartnersApproached <= 100000))
+        && (!('totalActivePartners' in data) || (isNonNegNum(data.totalActivePartners) && data.totalActivePartners <= 1000000))
+        && (!('thingsWorked' in data) || isStr(data.thingsWorked, 0, 3000))
+        && (!('thingsDidNotWork' in data) || isStr(data.thingsDidNotWork, 0, 3000))
+        && (!('nextWeekTargetAmountKes' in data) || isNonNegNum(data.nextWeekTargetAmountKes))
+        && (!('nextWeekPartnersToReachOut' in data) || (isNonNegNum(data.nextWeekPartnersToReachOut) && data.nextWeekPartnersToReachOut <= 100000))
+        && (!('nextWeekCallsToMake' in data) || (isNonNegNum(data.nextWeekCallsToMake) && data.nextWeekCallsToMake <= 100000))
+        && (!('nextWeekNewAppointments' in data) || (isNonNegNum(data.nextWeekNewAppointments) && data.nextWeekNewAppointments <= 100000))
+        && (!('workProgress' in data) || isStr(data.workProgress, 0, 3000))
+        && (!('personalDevotion' in data) || isStr(data.personalDevotion, 0, 3000))
+        && (!('mentorshipUpdate' in data) || isStr(data.mentorshipUpdate, 0, 3000))
+        && (!('attachmentName' in data) || isStr(data.attachmentName, 0, 200))
+        && (!('supervisorComment' in data) || isStr(data.supervisorComment, 0, 1500))
+        && (!('evaluationScore' in data) || ((data.evaluationScore is int || data.evaluationScore is float) && data.evaluationScore >= 1 && data.evaluationScore <= 5))
+        && (!('submittedAt' in data) || isStr(data.submittedAt, 0, 40))
+        && (!('reviewedAt' in data) || isStr(data.reviewedAt, 0, 40))
+        && (!('reviewedBy' in data) || isStr(data.reviewedBy, 0, 160))
+        && (!('revisionCount' in data) || isNonNegNum(data.revisionCount))
+        && (!('revisionHistoryJson' in data) || isStr(data.revisionHistoryJson, 0, 8000))
+        && (!('clientRequestId' in data) || isStr(data.clientRequestId, 0, 128))
+        && (!('viewerUids' in data) || isBoundedUidList(data.viewerUids))
+        && (!('isDemo' in data) || data.isDemo is bool)
+        && data.createdAt is timestamp
+        && data.updatedAt == request.time;
+    }
+
+    match /apprenticeReports/{reportId} {
+      allow get: if isValidId(reportId) && (isSupervisor() || isHR() || (isVerifiedUser() && (resource.data.apprenticeUserId == request.auth.uid || isViewer(resource.data))));
+      allow list: if isBootstrappedAdmin() || isHR() || (isVerifiedUser() && (resource.data.apprenticeUserId == request.auth.uid || resource.data.supervisorId == request.auth.uid || isViewer(resource.data)));
+      allow create: if isValidId(reportId) && isVerifiedUser() && isValidApprenticeReport(incoming())
+        && incoming().createdAt == request.time
+        && (isAdmin() || (incoming().apprenticeUserId == request.auth.uid && incoming().status in ['draft', 'submitted']));
+      allow update: if isValidId(reportId) && isVerifiedUser() && isValidApprenticeReport(incoming())
+        && incoming().createdAt == existing().createdAt
+        && incoming().apprenticeUserId == existing().apprenticeUserId
+        && (
+          isAdmin() ||
+          (
+            existing().status in ['draft', 'submitted', 'under_review', 'returned'] &&
+            (
+              (existing().apprenticeUserId == request.auth.uid
+                && existing().status in ['draft', 'returned']
+                && incoming().status in ['draft', 'submitted']
+                && incoming().diff(existing()).affectedKeys().hasOnly([
+                  'reportType', 'periodStart', 'periodEnd', 'activities', 'lessonsLearned',
+                  'challenges', 'reflections',
+                  'monthlyTargetKes', 'amountRaisedKes', 'deficitKes',
+                  'callsMadeThisWeek', 'newPartnersApproached', 'totalActivePartners',
+                  'thingsWorked', 'thingsDidNotWork',
+                  'nextWeekTargetAmountKes', 'nextWeekPartnersToReachOut',
+                  'nextWeekCallsToMake', 'nextWeekNewAppointments',
+                  'workProgress', 'personalDevotion', 'mentorshipUpdate',
+                  'attachmentName', 'status', 'submittedAt', 'revisionCount', 'revisionHistoryJson', 'updatedAt'
+                ])) ||
+              (isSupervisor()
+                && existing().apprenticeUserId != request.auth.uid
+                && existing().status in ['submitted', 'under_review']
+                && incoming().status in ['under_review', 'approved', 'returned']
+                && incoming().diff(existing()).affectedKeys().hasOnly([
+                  'status', 'supervisorComment', 'evaluationScore', 'reviewedAt', 'reviewedBy', 'revisionHistoryJson', 'updatedAt'
+                ]))
+            )
+          )
+        );
+      allow delete: if isValidId(reportId) && isAdmin();
+    }
+
+    // -------------------------------------------------------------------------
+    // 10b. Book Reviews (/bookReviews/{reviewId})
+    // -------------------------------------------------------------------------
+    function isValidBookReview(data) {
+      return data.keys().hasAll(['orgId', 'apprenticeId', 'apprenticeUserId', 'apprenticeName', 'supervisorId', 'bookTitle', 'author', 'dateCompleted', 'summary', 'lessonsLearned', 'overallReview', 'rating', 'status', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly([
+          'orgId', 'apprenticeId', 'apprenticeUserId', 'apprenticeName', 'supervisorId',
+          'bookTitle', 'author', 'dateCompleted', 'summary', 'lessonsLearned', 'overallReview', 'rating',
+          'coverOrSupportName', 'coverOrSupportMime', 'coverOrSupportDataUrl',
+          'pdfAttachmentName', 'pdfAttachmentDataUrl',
+          'status', 'supervisorComment', 'reviewedBy', 'reviewedAt', 'submittedAt',
+          'viewerUids', 'isDemo', 'createdAt', 'updatedAt'
+        ])
+        && data.orgId == 'iserve-africa'
+        && isStr(data.apprenticeId, 1, 128)
+        && isStr(data.apprenticeUserId, 1, 128)
+        && isStr(data.apprenticeName, 1, 160)
+        && isStr(data.supervisorId, 1, 128)
+        && isStr(data.bookTitle, 2, 200)
+        && isStr(data.author, 2, 160)
+        && isStr(data.dateCompleted, 8, 32)
+        && isStr(data.summary, 5, 4000)
+        && isStr(data.lessonsLearned, 5, 4000)
+        && isStr(data.overallReview, 5, 4000)
+        && (data.rating is int || data.rating is float) && data.rating >= 1 && data.rating <= 5
+        && data.status in ['draft', 'submitted', 'under_review', 'approved', 'returned']
+        && (!('coverOrSupportName' in data) || isStr(data.coverOrSupportName, 0, 200))
+        && (!('coverOrSupportMime' in data) || isStr(data.coverOrSupportMime, 0, 100))
+        && (!('coverOrSupportDataUrl' in data) || isStr(data.coverOrSupportDataUrl, 0, 450000))
+        && (!('pdfAttachmentName' in data) || isStr(data.pdfAttachmentName, 0, 200))
+        && (!('pdfAttachmentDataUrl' in data) || isStr(data.pdfAttachmentDataUrl, 0, 650000))
+        && (!('supervisorComment' in data) || isStr(data.supervisorComment, 0, 1500))
+        && (!('reviewedBy' in data) || isStr(data.reviewedBy, 0, 160))
+        && (!('reviewedAt' in data) || isStr(data.reviewedAt, 0, 40))
+        && (!('submittedAt' in data) || isStr(data.submittedAt, 0, 40))
+        && (!('viewerUids' in data) || isBoundedUidList(data.viewerUids))
+        && (!('isDemo' in data) || data.isDemo is bool)
+        && data.createdAt is timestamp
+        && data.updatedAt == request.time;
+    }
+
+    match /bookReviews/{reviewId} {
+      allow get: if isValidId(reviewId) && (isSupervisor() || isHR() || (isVerifiedUser() && (resource.data.apprenticeUserId == request.auth.uid || isViewer(resource.data))));
+      allow list: if isBootstrappedAdmin() || isHR() || (isVerifiedUser() && (resource.data.apprenticeUserId == request.auth.uid || resource.data.supervisorId == request.auth.uid || isViewer(resource.data)));
+      allow create: if isValidId(reviewId) && isVerifiedUser() && isValidBookReview(incoming())
+        && incoming().createdAt == request.time
+        && (isAdmin() || (incoming().apprenticeUserId == request.auth.uid && incoming().status in ['draft', 'submitted']));
+      allow update: if isValidId(reviewId) && isVerifiedUser() && isValidBookReview(incoming())
+        && incoming().createdAt == existing().createdAt
+        && incoming().apprenticeUserId == existing().apprenticeUserId
+        && (
+          isAdmin() ||
+          (
+            existing().status in ['draft', 'returned']
+            && existing().apprenticeUserId == request.auth.uid
+            && incoming().status in ['draft', 'submitted']
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'bookTitle', 'author', 'dateCompleted', 'summary', 'lessonsLearned', 'overallReview', 'rating',
+              'coverOrSupportName', 'coverOrSupportMime', 'coverOrSupportDataUrl',
+              'pdfAttachmentName', 'pdfAttachmentDataUrl', 'status', 'submittedAt', 'updatedAt'
+            ])
+          ) ||
+          (
+            isSupervisor()
+            && existing().apprenticeUserId != request.auth.uid
+            && existing().status in ['submitted', 'under_review']
+            && incoming().status in ['under_review', 'approved', 'returned']
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'status', 'supervisorComment', 'reviewedBy', 'reviewedAt', 'updatedAt'
+            ])
+          )
+        );
+      allow delete: if isValidId(reviewId) && (isAdmin() || (isVerifiedUser() && existing().apprenticeUserId == request.auth.uid && existing().status == 'draft'));
+    }
+
+    // -------------------------------------------------------------------------
+    // 10c. Imprest Records, Retirements & Receipts (Strict Medical Privacy)
+    // -------------------------------------------------------------------------
+    function isValidImprestRecord(data) {
+      return data.keys().hasAll(['orgId', 'referenceNo', 'apprenticeId', 'apprenticeUserId', 'apprenticeName', 'category', 'amountReceivedKes', 'dateReceived', 'purpose', 'issuedBy', 'status', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly([
+          'orgId', 'referenceNo', 'apprenticeId', 'apprenticeUserId', 'apprenticeName',
+          'category', 'amountReceivedKes', 'dateReceived', 'purpose', 'issuedBy', 'issuedByName',
+          'status', 'isDemo', 'createdAt', 'updatedAt'
+        ])
+        && data.orgId == 'iserve-africa'
+        && isStr(data.referenceNo, 2, 40)
+        && isStr(data.apprenticeId, 1, 128)
+        && isStr(data.apprenticeUserId, 1, 128)
+        && isStr(data.apprenticeName, 1, 160)
+        && data.category in ['transport', 'pd', 'medical']
+        && isPosNum(data.amountReceivedKes)
+        && isStr(data.dateReceived, 8, 32)
+        && isStr(data.purpose, 2, 500)
+        && isStr(data.issuedBy, 1, 128)
+        && (!('issuedByName' in data) || isStr(data.issuedByName, 0, 160))
+        && data.status in ['issued', 'retired', 'settled']
+        && (!('isDemo' in data) || data.isDemo is bool)
+        && data.createdAt is timestamp
+        && data.updatedAt == request.time;
+    }
+
+    match /imprestRecords/{recordId} {
+      allow get: if isValidId(recordId) && (
+        isFinance() ||
+        (resource.data.category == 'medical' && isHR()) ||
+        (isVerifiedUser() && resource.data.apprenticeUserId == request.auth.uid)
+      );
+      allow list: if isBootstrappedAdmin() || isFinance() || (
+        isHR() && resource.data.category == 'medical'
+      ) || (
+        isVerifiedUser() && resource.data.apprenticeUserId == request.auth.uid
+      );
+      allow create: if isValidId(recordId) && isFinance() && isValidImprestRecord(incoming()) && incoming().createdAt == request.time;
+      allow update: if isValidId(recordId) && isFinance() && isValidImprestRecord(incoming()) && incoming().createdAt == existing().createdAt;
+      allow delete: if isValidId(recordId) && isAdmin();
+    }
+
+    function isValidImprestRetirement(data) {
+      return data.keys().hasAll(['orgId', 'referenceNo', 'apprenticeId', 'apprenticeUserId', 'apprenticeName', 'category', 'amountReceivedKes', 'originalAmountReceivedKes', 'dateReceived', 'actualSpentKes', 'unspentBalanceKes', 'additionalRequiredKes', 'status', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly([
+          'orgId', 'imprestRecordId', 'referenceNo', 'apprenticeId', 'apprenticeUserId', 'apprenticeName',
+          'category', 'amountReceivedKes', 'originalAmountReceivedKes', 'dateReceived',
+          'purpose', 'destination', 'travelDate', 'pdActivity', 'medicalPurpose', 'expenditureDate',
+          'expenditureDescription', 'expenditureBreakdown', 'actualSpentKes', 'unspentBalanceKes', 'additionalRequiredKes',
+          'comments', 'accountingSheetName', 'accountingSheetDataUrl', 'receiptCount',
+          'status', 'financeComment', 'reviewedBy', 'reviewedAt', 'settledBy', 'settledAt', 'submittedAt',
+          'revisionHistoryJson', 'isDemo', 'createdAt', 'updatedAt'
+        ])
+        && data.orgId == 'iserve-africa'
+        && isStr(data.referenceNo, 2, 40)
+        && isStr(data.apprenticeId, 1, 128)
+        && isStr(data.apprenticeUserId, 1, 128)
+        && isStr(data.apprenticeName, 1, 160)
+        && data.category in ['transport', 'pd', 'medical']
+        && isNonNegNum(data.amountReceivedKes)
+        && isNonNegNum(data.originalAmountReceivedKes)
+        && isStr(data.dateReceived, 8, 32)
+        && isNonNegNum(data.actualSpentKes)
+        && isNonNegNum(data.unspentBalanceKes)
+        && isNonNegNum(data.additionalRequiredKes)
+        && data.status in ['draft', 'submitted', 'under_review', 'returned', 'approved', 'settled']
+        && (!('imprestRecordId' in data) || isStr(data.imprestRecordId, 0, 128))
+        && (!('purpose' in data) || isStr(data.purpose, 0, 600))
+        && (!('destination' in data) || isStr(data.destination, 0, 200))
+        && (!('travelDate' in data) || isStr(data.travelDate, 0, 32))
+        && (!('pdActivity' in data) || isStr(data.pdActivity, 0, 400))
+        && (!('medicalPurpose' in data) || isStr(data.medicalPurpose, 0, 400))
+        && (!('expenditureDate' in data) || isStr(data.expenditureDate, 0, 32))
+        && (!('expenditureDescription' in data) || isStr(data.expenditureDescription, 0, 1500))
+        && (!('expenditureBreakdown' in data) || isStr(data.expenditureBreakdown, 0, 2500))
+        && (!('comments' in data) || isStr(data.comments, 0, 1500))
+        && (!('accountingSheetName' in data) || isStr(data.accountingSheetName, 0, 200))
+        && (!('accountingSheetDataUrl' in data) || isStr(data.accountingSheetDataUrl, 0, 650000))
+        && (!('receiptCount' in data) || isNonNegNum(data.receiptCount))
+        && (!('financeComment' in data) || isStr(data.financeComment, 0, 1500))
+        && (!('reviewedBy' in data) || isStr(data.reviewedBy, 0, 160))
+        && (!('reviewedAt' in data) || isStr(data.reviewedAt, 0, 40))
+        && (!('settledBy' in data) || isStr(data.settledBy, 0, 160))
+        && (!('settledAt' in data) || isStr(data.settledAt, 0, 40))
+        && (!('submittedAt' in data) || isStr(data.submittedAt, 0, 40))
+        && (!('revisionHistoryJson' in data) || isStr(data.revisionHistoryJson, 0, 6000))
+        && (!('isDemo' in data) || data.isDemo is bool)
+        && data.createdAt is timestamp
+        && data.updatedAt == request.time;
+    }
+
+    match /imprestRetirements/{retirementId} {
+      allow get: if isValidId(retirementId) && (
+        isFinance() ||
+        (resource.data.category == 'medical' && isHR()) ||
+        (isVerifiedUser() && resource.data.apprenticeUserId == request.auth.uid)
+      );
+      allow list: if isBootstrappedAdmin() || isFinance() || (
+        isHR() && resource.data.category == 'medical'
+      ) || (
+        isVerifiedUser() && resource.data.apprenticeUserId == request.auth.uid
+      );
+      allow create: if isValidId(retirementId) && isVerifiedUser() && isValidImprestRetirement(incoming())
+        && incoming().createdAt == request.time
+        && (isFinance() || (incoming().apprenticeUserId == request.auth.uid && incoming().status in ['draft', 'submitted']));
+      allow update: if isValidId(retirementId) && isVerifiedUser() && isValidImprestRetirement(incoming())
+        && incoming().createdAt == existing().createdAt
+        && incoming().apprenticeUserId == existing().apprenticeUserId
+        && incoming().category == existing().category
+        && incoming().originalAmountReceivedKes == existing().originalAmountReceivedKes
+        && (
+          isAdmin() ||
+          (
+            existing().apprenticeUserId == request.auth.uid
+            && existing().status in ['draft', 'returned']
+            && incoming().status in ['draft', 'submitted']
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'imprestRecordId', 'amountReceivedKes', 'dateReceived', 'purpose', 'destination', 'travelDate',
+              'pdActivity', 'medicalPurpose', 'expenditureDate', 'expenditureDescription', 'expenditureBreakdown',
+              'actualSpentKes', 'unspentBalanceKes', 'additionalRequiredKes', 'comments',
+              'accountingSheetName', 'accountingSheetDataUrl', 'receiptCount',
+              'status', 'submittedAt', 'revisionHistoryJson', 'updatedAt'
+            ])
+          ) ||
+          (
+            isFinance()
+            && existing().apprenticeUserId != request.auth.uid
+            && existing().status in ['submitted', 'under_review', 'approved', 'returned']
+            && incoming().status in ['under_review', 'returned', 'approved', 'settled']
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'status', 'financeComment', 'reviewedBy', 'reviewedAt', 'settledBy', 'settledAt', 'updatedAt'
+            ])
+          )
+        );
+      allow delete: if isValidId(retirementId) && (isAdmin() || (isVerifiedUser() && existing().apprenticeUserId == request.auth.uid && existing().status == 'draft'));
+    }
+
+    function isValidImprestReceipt(data) {
+      return data.keys().hasAll(['orgId', 'retirementId', 'apprenticeUserId', 'category', 'docKind', 'fileName', 'mimeType', 'fileSizeKb', 'dataUrl', 'createdAt'])
+        && data.keys().hasOnly([
+          'orgId', 'retirementId', 'apprenticeUserId', 'category', 'docKind', 'fileName', 'mimeType', 'fileSizeKb', 'dataUrl', 'createdAt'
+        ])
+        && data.orgId == 'iserve-africa'
+        && isStr(data.retirementId, 1, 128)
+        && isStr(data.apprenticeUserId, 1, 128)
+        && data.category in ['transport', 'pd', 'medical']
+        && data.docKind in ['receipt', 'supporting']
+        && isStr(data.fileName, 1, 200)
+        && data.mimeType in ['application/pdf', 'image/jpeg', 'image/png']
+        && isPosNum(data.fileSizeKb) && data.fileSizeKb <= 750
+        && isStr(data.dataUrl, 10, 700000)
+        && data.createdAt == request.time;
+    }
+
+    match /imprestReceipts/{receiptId} {
+      allow get: if isValidId(receiptId) && (
+        isFinance() ||
+        (resource.data.category == 'medical' && isHR()) ||
+        (isVerifiedUser() && resource.data.apprenticeUserId == request.auth.uid)
+      );
+      allow list: if isBootstrappedAdmin() || isFinance() || (
+        isHR() && resource.data.category == 'medical'
+      ) || (
+        isVerifiedUser() && resource.data.apprenticeUserId == request.auth.uid
+      );
+      allow create: if isValidId(receiptId) && isVerifiedUser() && isValidImprestReceipt(incoming())
+        && (isFinance() || incoming().apprenticeUserId == request.auth.uid);
+      allow update: if false;
+      allow delete: if isValidId(receiptId) && (isAdmin() || isFinance() || (isVerifiedUser() && existing().apprenticeUserId == request.auth.uid));
+    }
+
+    // -------------------------------------------------------------------------
+    // 10d. Monthly PD Reports (/monthlyPdReports/{reportId})
+    // -------------------------------------------------------------------------
+    function isValidMonthlyPdReport(data) {
+      return data.keys().hasAll(['orgId', 'apprenticeId', 'apprenticeUserId', 'apprenticeName', 'reportMonth', 'reportYear', 'periodKey', 'title', 'publishedDate', 'fileName', 'pdfDataUrl', 'version', 'uploadedBy', 'uploadedByName', 'status', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly([
+          'orgId', 'apprenticeId', 'apprenticeUserId', 'apprenticeName', 'apprenticeCode',
+          'reportMonth', 'reportYear', 'periodKey', 'title', 'description', 'publishedDate',
+          'fileName', 'fileSizeKb', 'pdfDataUrl', 'version', 'versionHistoryJson',
+          'uploadedBy', 'uploadedByName', 'status', 'isDemo', 'createdAt', 'updatedAt'
+        ])
+        && data.orgId == 'iserve-africa'
+        && isStr(data.apprenticeId, 1, 128)
+        && isStr(data.apprenticeUserId, 1, 128)
+        && isStr(data.apprenticeName, 1, 160)
+        && (!('apprenticeCode' in data) || isStr(data.apprenticeCode, 0, 32))
+        && data.reportMonth is int && data.reportMonth >= 1 && data.reportMonth <= 12
+        && data.reportYear is int && data.reportYear >= 2020 && data.reportYear <= 2100
+        && isStr(data.periodKey, 7, 16)
+        && isStr(data.title, 2, 200)
+        && (!('description' in data) || isStr(data.description, 0, 2000))
+        && isStr(data.publishedDate, 8, 32)
+        && isStr(data.fileName, 1, 200)
+        && (!('fileSizeKb' in data) || isNonNegNum(data.fileSizeKb))
+        && isStr(data.pdfDataUrl, 10, 750000)
+        && data.version is int && data.version >= 1
+        && (!('versionHistoryJson' in data) || isStr(data.versionHistoryJson, 0, 8000))
+        && isStr(data.uploadedBy, 1, 128)
+        && isStr(data.uploadedByName, 1, 160)
+        && data.status == 'published'
+        && (!('isDemo' in data) || data.isDemo is bool)
+        && data.createdAt is timestamp
+        && data.updatedAt == request.time;
+    }
+
+    match /monthlyPdReports/{reportId} {
+      allow get: if isValidId(reportId) && (isFinance() || (isVerifiedUser() && resource.data.apprenticeUserId == request.auth.uid));
+      allow list: if isBootstrappedAdmin() || isFinance() || (isVerifiedUser() && resource.data.apprenticeUserId == request.auth.uid);
+      allow create: if isValidId(reportId) && isFinance() && isValidMonthlyPdReport(incoming()) && incoming().createdAt == request.time;
+      allow update: if isValidId(reportId) && isFinance() && isValidMonthlyPdReport(incoming()) && incoming().createdAt == existing().createdAt && incoming().apprenticeUserId == existing().apprenticeUserId;
+      allow delete: if isValidId(reportId) && isAdmin();
+    }
+
+    // -------------------------------------------------------------------------
+    // 11. Budgets (/budgets/{budgetId})
+    // -------------------------------------------------------------------------
+    function isValidBudget(data) {
+      return data.keys().hasAll(['orgId', 'title', 'fiscalYear', 'scope', 'category', 'allocatedKes', 'spentKes', 'status', 'createdBy', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly([
+          'orgId', 'title', 'fiscalYear', 'scope', 'departmentId', 'departmentName',
+          'projectId', 'category', 'allocatedKes', 'spentKes', 'status', 'createdBy',
+          'isDemo', 'createdAt', 'updatedAt'
+        ])
+        && data.orgId == 'iserve-africa'
+        && isStr(data.title, 2, 160)
+        && isStr(data.fiscalYear, 4, 16)
+        && data.scope in ['organisational', 'departmental', 'project']
+        && isStr(data.category, 2, 100)
+        && isNonNegNum(data.allocatedKes)
+        && isNonNegNum(data.spentKes)
+        && data.status in ['active', 'closed']
+        && isStr(data.createdBy, 1, 128)
+        && (!('departmentId' in data) || isStr(data.departmentId, 0, 128))
+        && (!('departmentName' in data) || isStr(data.departmentName, 0, 120))
+        && (!('projectId' in data) || isStr(data.projectId, 0, 128))
+        && (!('isDemo' in data) || data.isDemo is bool)
+        && data.createdAt is timestamp
+        && data.updatedAt == request.time;
+    }
+
+    match /budgets/{budgetId} {
+      allow get: if isValidId(budgetId) && isVerifiedUser();
+      allow list: if isVerifiedUser() && resource.data.orgId == 'iserve-africa';
+      allow create: if isValidId(budgetId) && isFinance() && isValidBudget(incoming())
+        && incoming().createdBy == request.auth.uid && incoming().createdAt == request.time;
+      allow update: if isValidId(budgetId) && isFinance() && isValidBudget(incoming())
+        && incoming().createdBy == existing().createdBy && incoming().createdAt == existing().createdAt;
+      allow delete: if isValidId(budgetId) && isAdmin();
+    }
+
+    // -------------------------------------------------------------------------
+    // 12. Finance Transactions (/financeTransactions/{txId})
+    // -------------------------------------------------------------------------
+    function isValidFinanceTransaction(data) {
+      return data.keys().hasAll(['orgId', 'txNumber', 'txType', 'title', 'category', 'amountKes', 'requestedBy', 'status', 'qbSyncStatus', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly([
+          'orgId', 'txNumber', 'txType', 'title', 'category', 'departmentId', 'departmentName',
+          'projectId', 'projectName', 'amountKes', 'payee', 'description', 'receiptRef',
+          'requestedBy', 'requestedByName', 'status', 'approverId', 'approverName',
+          'approvalComment', 'qbSyncStatus', 'qbSyncError', 'viewerUids', 'isDemo', 'createdAt', 'updatedAt'
+        ])
+        && data.orgId == 'iserve-africa'
+        && isStr(data.txNumber, 3, 40)
+        && data.txType in ['payment_request', 'expense', 'petty_cash', 'income']
+        && isStr(data.title, 2, 200)
+        && isStr(data.category, 2, 100)
+        && isPosNum(data.amountKes)
+        && isStr(data.requestedBy, 1, 128)
+        && data.status in ['draft', 'submitted', 'pending_approval', 'approved', 'rejected', 'returned', 'paid', 'retired', 'cancelled']
+        && data.qbSyncStatus in ['not_configured', 'credentials_required', 'pending', 'synced', 'error']
+        && (!('departmentId' in data) || isStr(data.departmentId, 0, 128))
+        && (!('departmentName' in data) || isStr(data.departmentName, 0, 120))
+        && (!('projectId' in data) || isStr(data.projectId, 0, 128))
+        && (!('projectName' in data) || isStr(data.projectName, 0, 160))
+        && (!('payee' in data) || isStr(data.payee, 0, 160))
+        && (!('description' in data) || isStr(data.description, 0, 1200))
+        && (!('receiptRef' in data) || isStr(data.receiptRef, 0, 160))
+        && (!('requestedByName' in data) || isStr(data.requestedByName, 0, 160))
+        && (!('approverId' in data) || isStr(data.approverId, 0, 128))
+        && (!('approverName' in data) || isStr(data.approverName, 0, 160))
+        && (!('approvalComment' in data) || isStr(data.approvalComment, 0, 600))
+        && (!('qbSyncError' in data) || isStr(data.qbSyncError, 0, 400))
+        && (!('viewerUids' in data) || isBoundedUidList(data.viewerUids))
+        && (!('isDemo' in data) || data.isDemo is bool)
+        && data.createdAt is timestamp
+        && data.updatedAt == request.time;
+    }
+
+    match /financeTransactions/{txId} {
+      allow get: if isValidId(txId) && (isFinance() || isDepartmentHead() || (isVerifiedUser() && (resource.data.requestedBy == request.auth.uid || isViewer(resource.data))));
+      allow list: if isBootstrappedAdmin() || (isVerifiedUser() && (resource.data.requestedBy == request.auth.uid || isViewer(resource.data)));
+      allow create: if isValidId(txId) && isVerifiedUser() && isValidFinanceTransaction(incoming())
+        && incoming().createdAt == request.time
+        && (isAdmin() || (incoming().requestedBy == request.auth.uid && incoming().status in ['draft', 'submitted', 'pending_approval']));
+      allow update: if isValidId(txId) && isVerifiedUser() && isValidFinanceTransaction(incoming())
+        && incoming().createdAt == existing().createdAt
+        && incoming().requestedBy == existing().requestedBy
+        && (
+          isAdmin() ||
+          (
+            !(existing().status in ['paid', 'cancelled']) &&
+            (
+              (isFinance() && existing().requestedBy != request.auth.uid
+                && incoming().approverId == request.auth.uid
+                && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'approverId', 'approverName', 'approvalComment', 'qbSyncStatus', 'qbSyncError', 'updatedAt'])) ||
+              (existing().requestedBy == request.auth.uid
+                && existing().status in ['draft', 'returned', 'paid']
+                && incoming().diff(existing()).affectedKeys().hasOnly(['title', 'amountKes', 'description', 'receiptRef', 'status', 'updatedAt']))
+            )
+          )
+        );
+      allow delete: if isValidId(txId) && isAdmin();
+    }
+
+    // -------------------------------------------------------------------------
+    // 13. Books (/books/{bookId}) & 14. Book Sales (/bookSales/{saleId})
+    // -------------------------------------------------------------------------
+    function isValidBook(data) {
+      return data.keys().hasAll(['orgId', 'isbn', 'title', 'author', 'category', 'costKes', 'priceKes', 'stockQty', 'reorderLevel', 'status', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly([
+          'orgId', 'isbn', 'title', 'author', 'publisher', 'category', 'description',
+          'costKes', 'priceKes', 'stockQty', 'reorderLevel', 'imageUrl', 'status',
+          'isDemo', 'createdAt', 'updatedAt'
+        ])
+        && data.orgId == 'iserve-africa'
+        && isStr(data.isbn, 3, 32)
+        && isStr(data.title, 2, 200)
+        && isStr(data.author, 2, 160)
+        && isStr(data.category, 2, 100)
+        && isNonNegNum(data.costKes)
+        && isPosNum(data.priceKes)
+        && isNonNegNum(data.stockQty)
+        && isNonNegNum(data.reorderLevel)
+        && data.status in ['active', 'discontinued']
+        && (!('publisher' in data) || isStr(data.publisher, 0, 160))
+        && (!('description' in data) || isStr(data.description, 0, 1000))
+        && (!('imageUrl' in data) || isStr(data.imageUrl, 0, 400))
+        && (!('isDemo' in data) || data.isDemo is bool)
+        && data.createdAt is timestamp
+        && data.updatedAt == request.time;
+    }
+
+    match /books/{bookId} {
+      allow get: if isValidId(bookId) && isVerifiedUser();
+      allow list: if isVerifiedUser() && resource.data.orgId == 'iserve-africa';
+      allow create: if isValidId(bookId) && isBookstoreManager() && isValidBook(incoming()) && incoming().createdAt == request.time;
+      allow update: if isValidId(bookId) && isBookstoreStaff() && isValidBook(incoming()) && incoming().createdAt == existing().createdAt && (
+        isBookstoreManager() ||
+        incoming().diff(existing()).affectedKeys().hasOnly(['stockQty', 'updatedAt'])
+      );
+      allow delete: if isValidId(bookId) && isAdmin();
+    }
+
+    function isValidBookSale(data) {
+      return data.keys().hasAll(['orgId', 'receiptNo', 'cashierId', 'paymentMethod', 'subtotalKes', 'discountKes', 'totalKes', 'itemCount', 'createdAt'])
+        && data.keys().hasOnly([
+          'orgId', 'receiptNo', 'cashierId', 'cashierName', 'customerName', 'paymentMethod',
+          'paymentRef', 'subtotalKes', 'discountKes', 'totalKes', 'itemCount',
+          'itemsSummary', 'qbSyncStatus', 'viewerUids', 'isDemo', 'createdAt'
+        ])
+        && data.orgId == 'iserve-africa'
+        && isStr(data.receiptNo, 3, 40)
+        && isStr(data.cashierId, 1, 128)
+        && data.paymentMethod in ['cash', 'mpesa', 'bank_transfer', 'card']
+        && isPosNum(data.subtotalKes)
+        && isNonNegNum(data.discountKes)
+        && isNonNegNum(data.totalKes)
+        && isPosNum(data.itemCount)
+        && (!('cashierName' in data) || isStr(data.cashierName, 0, 160))
+        && (!('customerName' in data) || isStr(data.customerName, 0, 160))
+        && (!('paymentRef' in data) || isStr(data.paymentRef, 0, 80))
+        && (!('itemsSummary' in data) || isStr(data.itemsSummary, 0, 1000))
+        && (!('qbSyncStatus' in data) || data.qbSyncStatus in ['not_configured', 'credentials_required', 'pending', 'synced', 'error'])
+        && (!('viewerUids' in data) || isBoundedUidList(data.viewerUids))
+        && (!('isDemo' in data) || data.isDemo is bool)
+        && data.createdAt == request.time;
+    }
+
+    match /bookSales/{saleId} {
+      allow get: if isValidId(saleId) && (isBookstoreStaff() || (isVerifiedUser() && (resource.data.cashierId == request.auth.uid || isViewer(resource.data))));
+      allow list: if isBootstrappedAdmin() || (isVerifiedUser() && (resource.data.cashierId == request.auth.uid || isViewer(resource.data)));
+      allow create: if isValidId(saleId) && isBookstoreStaff() && isValidBookSale(incoming())
+        && (isAdmin() || incoming().cashierId == request.auth.uid);
+      allow update: if isValidId(saleId) && isAdmin();
+      allow delete: if false;
+    }
+
+    // -------------------------------------------------------------------------
+    // 15. Projects (/projects/{projectId})
+    // -------------------------------------------------------------------------
+    function isValidProject(data) {
+      return data.keys().hasAll(['orgId', 'code', 'title', 'donorFunded', 'departmentId', 'officerId', 'budgetKes', 'spentKes', 'progressPct', 'status', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly([
+          'orgId', 'code', 'title', 'description', 'donorFunded', 'donorName',
+          'departmentId', 'departmentName', 'officerId', 'officerName', 'objectives',
+          'budgetKes', 'spentKes', 'progressPct', 'startDate', 'endDate', 'status',
+          'isDemo', 'createdAt', 'updatedAt'
+        ])
+        && data.orgId == 'iserve-africa'
+        && isStr(data.code, 2, 32)
+        && isStr(data.title, 2, 200)
+        && data.donorFunded is bool
+        && isStr(data.departmentId, 1, 128)
+        && isStr(data.officerId, 1, 128)
+        && isNonNegNum(data.budgetKes)
+        && isNonNegNum(data.spentKes)
+        && (data.progressPct is int || data.progressPct is float) && data.progressPct >= 0 && data.progressPct <= 100
+        && data.status in ['planning', 'active', 'on_hold', 'completed']
+        && (!('description' in data) || isStr(data.description, 0, 1500))
+        && (!('donorName' in data) || isStr(data.donorName, 0, 160))
+        && (!('departmentName' in data) || isStr(data.departmentName, 0, 120))
+        && (!('officerName' in data) || isStr(data.officerName, 0, 160))
+        && (!('objectives' in data) || isStr(data.objectives, 0, 1500))
+        && (!('startDate' in data) || isStr(data.startDate, 0, 32))
+        && (!('endDate' in data) || isStr(data.endDate, 0, 32))
+        && (!('isDemo' in data) || data.isDemo is bool)
+        && data.createdAt is timestamp
+        && data.updatedAt == request.time;
+    }
+
+    match /projects/{projectId} {
+      allow get: if isValidId(projectId) && isVerifiedUser();
+      allow list: if isVerifiedUser() && resource.data.orgId == 'iserve-africa';
+      allow create: if isValidId(projectId) && isProjectOfficer() && isValidProject(incoming()) && incoming().createdAt == request.time;
+      allow update: if isValidId(projectId) && (isProjectOfficer() || (isVerifiedUser() && existing().officerId == request.auth.uid))
+        && isValidProject(incoming()) && incoming().createdAt == existing().createdAt;
+      allow delete: if isValidId(projectId) && isAdmin();
+    }
+
+    // -------------------------------------------------------------------------
+    // 15b. Project Milestones & Deliverables (/projectMilestones/{milestoneId})
+    // -------------------------------------------------------------------------
+    function isValidProjectMilestone(data) {
+      return data.keys().hasAll(['orgId', 'projectId', 'title', 'kind', 'startDate', 'endDate', 'progressPct', 'status', 'createdBy', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly([
+          'orgId', 'projectId', 'projectCode', 'projectTitle', 'title', 'kind',
+          'ownerName', 'startDate', 'endDate', 'progressPct', 'status', 'notes',
+          'createdBy', 'isDemo', 'createdAt', 'updatedAt'
+        ])
+        && data.orgId == 'iserve-africa'
+        && isStr(data.projectId, 1, 128)
+        && isStr(data.title, 2, 200)
+        && data.kind in ['milestone', 'deliverable']
+        && isStr(data.startDate, 8, 32)
+        && isStr(data.endDate, 8, 32)
+        && (data.progressPct is int || data.progressPct is float) && data.progressPct >= 0 && data.progressPct <= 100
+        && data.status in ['planned', 'in_progress', 'completed', 'delayed']
+        && isStr(data.createdBy, 1, 128)
+        && (!('projectCode' in data) || isStr(data.projectCode, 0, 32))
+        && (!('projectTitle' in data) || isStr(data.projectTitle, 0, 200))
+        && (!('ownerName' in data) || isStr(data.ownerName, 0, 160))
+        && (!('notes' in data) || isStr(data.notes, 0, 1000))
+        && (!('isDemo' in data) || data.isDemo is bool)
+        && data.createdAt is timestamp
+        && data.updatedAt == request.time;
+    }
+
+    match /projectMilestones/{milestoneId} {
+      allow get: if isValidId(milestoneId) && isVerifiedUser();
+      allow list: if isVerifiedUser() && resource.data.orgId == 'iserve-africa';
+      allow create: if isValidId(milestoneId) && isProjectOfficer() && isValidProjectMilestone(incoming())
+        && incoming().createdAt == request.time
+        && (isAdmin() || incoming().createdBy == request.auth.uid);
+      allow update: if isValidId(milestoneId) && isProjectOfficer() && isValidProjectMilestone(incoming())
+        && incoming().createdAt == existing().createdAt
+        && incoming().createdBy == existing().createdBy;
+      allow delete: if isValidId(milestoneId) && isProjectOfficer();
+    }
+
+    // -------------------------------------------------------------------------
+    // 16. Procurement Requests (/procurementRequests/{reqId})
+    // -------------------------------------------------------------------------
+    function isValidProcurementRequest(data) {
+      return data.keys().hasAll(['orgId', 'reqNo', 'title', 'departmentId', 'estimatedKes', 'requestedBy', 'status', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly([
+          'orgId', 'reqNo', 'title', 'departmentId', 'departmentName', 'supplierName',
+          'category', 'estimatedKes', 'justification', 'requestedBy', 'requestedByName',
+          'status', 'approverId', 'approvalComment', 'viewerUids', 'isDemo', 'createdAt', 'updatedAt'
+        ])
+        && data.orgId == 'iserve-africa'
+        && isStr(data.reqNo, 3, 40)
+        && isStr(data.title, 2, 200)
+        && isStr(data.departmentId, 1, 128)
+        && isPosNum(data.estimatedKes)
+        && isStr(data.requestedBy, 1, 128)
+        && data.status in ['draft', 'submitted', 'approved', 'po_issued', 'received', 'rejected']
+        && (!('departmentName' in data) || isStr(data.departmentName, 0, 120))
+        && (!('supplierName' in data) || isStr(data.supplierName, 0, 160))
+        && (!('category' in data) || isStr(data.category, 0, 100))
+        && (!('justification' in data) || isStr(data.justification, 0, 1200))
+        && (!('requestedByName' in data) || isStr(data.requestedByName, 0, 160))
+        && (!('approverId' in data) || isStr(data.approverId, 0, 128))
+        && (!('approvalComment' in data) || isStr(data.approvalComment, 0, 600))
+        && (!('viewerUids' in data) || isBoundedUidList(data.viewerUids))
+        && (!('isDemo' in data) || data.isDemo is bool)
+        && data.createdAt is timestamp
+        && data.updatedAt == request.time;
+    }
+
+    match /procurementRequests/{reqId} {
+      allow get: if isValidId(reqId) && (isFinance() || isDepartmentHead() || (isVerifiedUser() && (resource.data.requestedBy == request.auth.uid || isViewer(resource.data))));
+      allow list: if isBootstrappedAdmin() || (isVerifiedUser() && (resource.data.requestedBy == request.auth.uid || isViewer(resource.data)));
+      allow create: if isValidId(reqId) && isVerifiedUser() && isValidProcurementRequest(incoming())
+        && incoming().createdAt == request.time
+        && (isAdmin() || (incoming().requestedBy == request.auth.uid && incoming().status in ['draft', 'submitted']));
+      allow update: if isValidId(reqId) && isVerifiedUser() && isValidProcurementRequest(incoming())
+        && incoming().createdAt == existing().createdAt
+        && incoming().requestedBy == existing().requestedBy
+        && (
+          isAdmin() ||
+          (isFinance() && existing().requestedBy != request.auth.uid
+            && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'approverId', 'approvalComment', 'supplierName', 'updatedAt']))
+        );
+      allow delete: if isValidId(reqId) && isAdmin();
+    }
+
+    // -------------------------------------------------------------------------
+    // 17. Suppliers (/suppliers/{supplierId}) & 18. Assets (/assets/{assetId})
+    // -------------------------------------------------------------------------
+    function isValidSupplier(data) {
+      return data.keys().hasAll(['orgId', 'name', 'category', 'outstandingKes', 'status', 'createdAt'])
+        && data.keys().hasOnly([
+          'orgId', 'name', 'contactPerson', 'email', 'phone', 'category',
+          'kraPin', 'outstandingKes', 'status', 'isDemo', 'createdAt'
+        ])
+        && data.orgId == 'iserve-africa'
+        && isStr(data.name, 2, 160)
+        && isStr(data.category, 2, 100)
+        && isNonNegNum(data.outstandingKes)
+        && data.status in ['active', 'inactive']
+        && (!('contactPerson' in data) || isStr(data.contactPerson, 0, 160))
+        && (!('email' in data) || isStr(data.email, 0, 200))
+        && (!('phone' in data) || isStr(data.phone, 0, 40))
+        && (!('kraPin' in data) || isStr(data.kraPin, 0, 32))
+        && (!('isDemo' in data) || data.isDemo is bool)
+        && data.createdAt is timestamp;
+    }
+
+    match /suppliers/{supplierId} {
+      allow get: if isValidId(supplierId) && isVerifiedUser();
+      allow list: if isVerifiedUser() && resource.data.orgId == 'iserve-africa';
+      allow create: if isValidId(supplierId) && (isFinance() || isBookstoreManager()) && isValidSupplier(incoming()) && incoming().createdAt == request.time;
+      allow update: if isValidId(supplierId) && (isFinance() || isBookstoreManager()) && isValidSupplier(incoming()) && incoming().createdAt == existing().createdAt;
+      allow delete: if isValidId(supplierId) && isAdmin();
+    }
+
+    function isValidAsset(data) {
+      return data.keys().hasAll(['orgId', 'assetTag', 'name', 'category', 'purchaseCostKes', 'status', 'createdAt'])
+        && data.keys().hasOnly([
+          'orgId', 'assetTag', 'name', 'category', 'purchaseDate', 'purchaseCostKes',
+          'assignedToName', 'departmentId', 'location', 'condition', 'status',
+          'qrCodeValue', 'checkoutStatus', 'checkedOutTo', 'checkedOutByUid',
+          'checkedOutAt', 'lastScannedAt', 'lastScannedBy', 'scanNotes',
+          'isDemo', 'createdAt', 'updatedAt'
+        ])
+        && data.orgId == 'iserve-africa'
+        && isStr(data.assetTag, 2, 40)
+        && isStr(data.name, 2, 160)
+        && isStr(data.category, 2, 100)
+        && isNonNegNum(data.purchaseCostKes)
+        && data.status in ['active', 'maintenance', 'disposed']
+        && (!('purchaseDate' in data) || isStr(data.purchaseDate, 0, 32))
+        && (!('assignedToName' in data) || isStr(data.assignedToName, 0, 160))
+        && (!('departmentId' in data) || isStr(data.departmentId, 0, 128))
+        && (!('location' in data) || isStr(data.location, 0, 160))
+        && (!('condition' in data) || data.condition in ['excellent', 'good', 'fair', 'needs_repair'])
+        && (!('qrCodeValue' in data) || isStr(data.qrCodeValue, 0, 400))
+        && (!('checkoutStatus' in data) || data.checkoutStatus in ['available', 'checked_out'])
+        && (!('checkedOutTo' in data) || isStr(data.checkedOutTo, 0, 160))
+        && (!('checkedOutByUid' in data) || isStr(data.checkedOutByUid, 0, 128))
+        && (!('checkedOutAt' in data) || isStr(data.checkedOutAt, 0, 40))
+        && (!('lastScannedAt' in data) || isStr(data.lastScannedAt, 0, 40))
+        && (!('lastScannedBy' in data) || isStr(data.lastScannedBy, 0, 160))
+        && (!('scanNotes' in data) || isStr(data.scanNotes, 0, 600))
+        && (!('isDemo' in data) || data.isDemo is bool)
+        && data.createdAt is timestamp
+        && (!('updatedAt' in data) || data.updatedAt == request.time);
+    }
+
+    match /assets/{assetId} {
+      allow get: if isValidId(assetId) && isVerifiedUser();
+      allow list: if isVerifiedUser() && resource.data.orgId == 'iserve-africa';
+      allow create: if isValidId(assetId) && (isFinance() || isExecutive()) && isValidAsset(incoming()) && incoming().createdAt == request.time;
+      allow update: if isValidId(assetId) && isValidAsset(incoming()) && incoming().createdAt == existing().createdAt && (
+        isFinance() || isExecutive() ||
+        (hasActiveUserDoc()
+          && incoming().status in ['active', 'maintenance']
+          && incoming().diff(existing()).affectedKeys().hasOnly([
+            'checkoutStatus', 'checkedOutTo', 'checkedOutByUid', 'checkedOutAt',
+            'assignedToName', 'location', 'condition', 'status',
+            'lastScannedAt', 'lastScannedBy', 'scanNotes', 'updatedAt'
+          ]))
+      );
+      allow delete: if isValidId(assetId) && isAdmin();
+    }
+
+    // -------------------------------------------------------------------------
+    // 19. Documents (/documents/{docId})
+    // -------------------------------------------------------------------------
+    function isValidDocumentRecord(data) {
+      return data.keys().hasAll(['orgId', 'title', 'category', 'accessScope', 'version', 'fileName', 'uploadedBy', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly([
+          'orgId', 'title', 'category', 'departmentId', 'departmentName', 'accessScope',
+          'version', 'fileName', 'fileSizeKb', 'summary', 'contentText', 'uploadedBy',
+          'uploadedByName', 'isDemo', 'createdAt', 'updatedAt'
+        ])
+        && data.orgId == 'iserve-africa'
+        && isStr(data.title, 2, 200)
+        && isStr(data.category, 2, 100)
+        && data.accessScope in ['all_staff', 'department', 'management', 'finance', 'hr']
+        && isStr(data.version, 1, 24)
+        && isStr(data.fileName, 1, 200)
+        && isStr(data.uploadedBy, 1, 128)
+        && (!('departmentId' in data) || isStr(data.departmentId, 0, 128))
+        && (!('departmentName' in data) || isStr(data.departmentName, 0, 120))
+        && (!('fileSizeKb' in data) || isNonNegNum(data.fileSizeKb))
+        && (!('summary' in data) || isStr(data.summary, 0, 2000))
+        && (!('contentText' in data) || isStr(data.contentText, 0, 8000))
+        && (!('uploadedByName' in data) || isStr(data.uploadedByName, 0, 160))
+        && (!('isDemo' in data) || data.isDemo is bool)
+        && data.createdAt is timestamp
+        && data.updatedAt == request.time;
+    }
+
+    match /documents/{docId} {
+      allow get: if isValidId(docId) && isVerifiedUser() && (
+        isExecutive() ||
+        resource.data.accessScope in ['all_staff', 'department'] ||
+        (resource.data.accessScope == 'finance' && isFinance()) ||
+        (resource.data.accessScope == 'hr' && isHR()) ||
+        resource.data.uploadedBy == request.auth.uid
+      );
+      allow list: if isBootstrappedAdmin() || (isVerifiedUser() && (
+        resource.data.accessScope == 'all_staff' ||
+        resource.data.uploadedBy == request.auth.uid
+      ));
+      allow create: if isValidId(docId) && isVerifiedUser() && isValidDocumentRecord(incoming())
+        && incoming().createdAt == request.time
+        && (isAdmin() || incoming().uploadedBy == request.auth.uid);
+      allow update: if isValidId(docId) && isVerifiedUser() && isValidDocumentRecord(incoming())
+        && incoming().createdAt == existing().createdAt
+        && incoming().uploadedBy == existing().uploadedBy
+        && (isAdmin() || existing().uploadedBy == request.auth.uid);
+      allow delete: if isValidId(docId) && (isAdmin() || existing().uploadedBy == request.auth.uid);
+    }
+
+    // -------------------------------------------------------------------------
+    // 20. Admin Memos & Events (/adminMemos/{memoId})
+    // -------------------------------------------------------------------------
+    function isValidAdminMemo(data) {
+      return data.keys().hasAll(['orgId', 'recordType', 'title', 'body', 'authorId', 'createdAt'])
+        && data.keys().hasOnly([
+          'orgId', 'recordType', 'title', 'body', 'eventDate', 'location',
+          'departmentId', 'authorId', 'authorName', 'isDemo', 'createdAt'
+        ])
+        && data.orgId == 'iserve-africa'
+        && data.recordType in ['memo', 'event', 'meeting', 'announcement']
+        && isStr(data.title, 2, 200)
+        && isStr(data.body, 2, 3000)
+        && isStr(data.authorId, 1, 128)
+        && (!('eventDate' in data) || isStr(data.eventDate, 0, 32))
+        && (!('location' in data) || isStr(data.location, 0, 160))
+        && (!('departmentId' in data) || isStr(data.departmentId, 0, 128))
+        && (!('authorName' in data) || isStr(data.authorName, 0, 160))
+        && (!('isDemo' in data) || data.isDemo is bool)
+        && data.createdAt == request.time;
+    }
+
+    match /adminMemos/{memoId} {
+      allow get: if isValidId(memoId) && isVerifiedUser();
+      allow list: if isVerifiedUser() && resource.data.orgId == 'iserve-africa';
+      allow create: if isValidId(memoId) && (isExecutive() || isHR() || isDepartmentHead())
+        && isValidAdminMemo(incoming()) && (isAdmin() || incoming().authorId == request.auth.uid);
+      allow update: if false;
+      allow delete: if isValidId(memoId) && isAdmin();
+    }
+
+    // -------------------------------------------------------------------------
+    // 21. Notifications (/notifications/{notifId})
+    // -------------------------------------------------------------------------
+    function isValidNotification(data) {
+      return data.keys().hasAll(['recipientUid', 'title', 'message', 'category', 'read', 'createdAt'])
+        && data.keys().hasOnly(['recipientUid', 'title', 'message', 'category', 'linkModule', 'read', 'createdAt'])
+        && isStr(data.recipientUid, 1, 128)
+        && isStr(data.title, 1, 200)
+        && isStr(data.message, 1, 600)
+        && data.category in ['approval', 'report', 'leave', 'finance', 'project', 'document', 'system']
+        && data.read is bool
+        && (!('linkModule' in data) || isStr(data.linkModule, 0, 64))
+        && data.createdAt is timestamp;
+    }
+
+    match /notifications/{notifId} {
+      allow get: if isValidId(notifId) && isVerifiedUser() && (resource.data.recipientUid == request.auth.uid || isAdmin());
+      allow list: if isVerifiedUser() && resource.data.recipientUid == request.auth.uid;
+      allow create: if isValidId(notifId) && isVerifiedUser() && isValidNotification(incoming()) && incoming().createdAt == request.time;
+      allow update: if isValidId(notifId) && isVerifiedUser() && isValidNotification(incoming())
+        && existing().recipientUid == request.auth.uid
+        && incoming().recipientUid == existing().recipientUid
+        && incoming().createdAt == existing().createdAt
+        && incoming().diff(existing()).affectedKeys().hasOnly(['read']);
+      allow delete: if isValidId(notifId) && isVerifiedUser() && existing().recipientUid == request.auth.uid;
+    }
+
+    // -------------------------------------------------------------------------
+    // 22. Audit Logs (/auditLogs/{logId}) - Append-Only Immutable
+    // -------------------------------------------------------------------------
+    function isValidAuditLog(data) {
+      return data.keys().hasAll(['orgId', 'actorUid', 'actorName', 'actorRole', 'action', 'targetCollection', 'targetId', 'summary', 'createdAt'])
+        && data.keys().hasOnly(['orgId', 'actorUid', 'actorName', 'actorRole', 'action', 'targetCollection', 'targetId', 'summary', 'createdAt'])
+        && data.orgId == 'iserve-africa'
+        && isStr(data.actorUid, 1, 128)
+        && isStr(data.actorName, 1, 160)
+        && isStr(data.actorRole, 1, 64)
+        && isStr(data.action, 2, 100)
+        && isStr(data.targetCollection, 2, 64)
+        && isStr(data.targetId, 1, 128)
+        && isStr(data.summary, 2, 600)
+        && data.createdAt == request.time;
+    }
+
+    match /auditLogs/{logId} {
+      allow get: if isValidId(logId) && isExecutive();
+      allow list: if isBootstrappedAdmin() || (isVerifiedUser() && resource.data.actorUid == request.auth.uid);
+      allow create: if isValidId(logId) && isVerifiedUser() && isValidAuditLog(incoming()) && incoming().actorUid == request.auth.uid;
+      allow update, delete: if false;
+    }
+
+    // -------------------------------------------------------------------------
+    // 23. Integration Logs (/integrationLogs/{logId})
+    // -------------------------------------------------------------------------
+    function isValidIntegrationLog(data) {
+      return data.keys().hasAll(['orgId', 'provider', 'event', 'status', 'details', 'actorUid', 'createdAt'])
+        && data.keys().hasOnly(['orgId', 'provider', 'event', 'status', 'details', 'actorUid', 'createdAt'])
+        && data.orgId == 'iserve-africa'
+        && data.provider in ['quickbooks', 'mpesa', 'fcm', 'payroll']
+        && isStr(data.event, 2, 160)
+        && data.status in ['credentials_required', 'queued', 'error', 'synced']
+        && isStr(data.details, 2, 600)
+        && isStr(data.actorUid, 1, 128)
+        && data.createdAt == request.time;
+    }
+
+    match /integrationLogs/{logId} {
+      allow get: if isValidId(logId) && isFinance();
+      allow list: if isBootstrappedAdmin() || (isVerifiedUser() && resource.data.actorUid == request.auth.uid);
+      allow create: if isValidId(logId) && isFinance() && isValidIntegrationLog(incoming()) && incoming().actorUid == request.auth.uid;
+      allow update, delete: if false;
+    }
+  }
+}
